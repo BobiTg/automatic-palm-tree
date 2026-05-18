@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -18,6 +19,11 @@ CHANNEL_URL = "https://t.me/s/Billy_VPN_Emerald"
 KEYS_FILE = "keys/all_keys.txt"
 STATE_FILE = "keys/state.json"
 DAYS_INIT = 15
+MAX_PAGES = 60  # max pages to paginate (60 × ~20 msgs = ~1200 msgs)
+SUB_TIMEOUT = 5  # seconds per User-Agent attempt for subscriptions
+FETCH_TIMEOUT = 8  # seconds for channel page fetch
+SUB_WORKERS = 20  # parallel threads for subscription fetching
+MSG_WORKERS = 10  # parallel threads for message processing
 
 KEY_PATTERN = re.compile(
     r'(vless|vmess|ss|trojan|hy2|hysteria2|tuic)://[^\s\n\r<>"\'`]+',
@@ -111,43 +117,72 @@ def save_keys(keys_set: set) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _log(level: str, msg: str) -> None:
+    ts = datetime.utcnow().strftime("%H:%M:%S")
+    print(f"[{ts}][{level}] {msg}", flush=True)
+
+
 def fetch_page(url: str) -> str | None:
-    """Fetch a URL with browser headers; retry up to 3 times on failure."""
+    """Fetch a URL with browser headers; retry up to 2 times on failure."""
     headers = {
         "User-Agent": BROWSER_UA,
         "Accept-Language": "ru-RU,ru;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
-            resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+            resp = requests.get(
+                url, headers=headers, timeout=FETCH_TIMEOUT, allow_redirects=True
+            )
             if resp.status_code == 200:
                 return resp.text
-            print(
-                f"[WARN] fetch_page {url} → HTTP {resp.status_code} (attempt {attempt})"
+            _log(
+                "WARN",
+                f"fetch_page {url} → HTTP {resp.status_code} (attempt {attempt})",
             )
         except Exception as exc:
-            print(f"[WARN] fetch_page {url} attempt {attempt} error: {exc}")
-        if attempt < 3:
-            time.sleep(2)
+            _log("WARN", f"fetch_page {url} attempt {attempt} error: {exc}")
+        if attempt < 2:
+            time.sleep(1)
+    return None
+
+
+def _try_one_ua(url: str, ua: str) -> str | None:
+    """Single attempt: one URL + one User-Agent. Returns text or None."""
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": ua},
+            timeout=SUB_TIMEOUT,
+            allow_redirects=True,
+        )
+        if resp.status_code == 200 and len(resp.text) > 30:
+            return resp.text
+    except Exception:
+        pass
     return None
 
 
 def fetch_subscription(url: str) -> str | None:
-    """Try each User-Agent until we get a valid subscription response."""
-    for ua in USER_AGENTS:
-        try:
-            resp = requests.get(
-                url,
-                headers={"User-Agent": ua},
-                timeout=20,
-                allow_redirects=True,
-            )
-            if resp.status_code == 200 and len(resp.text) > 30:
-                return resp.text
-        except Exception as exc:
-            print(f"[WARN] fetch_subscription {url} ua={ua!r}: {exc}")
-    return None
+    """Try ALL User-Agents in PARALLEL, return first winner."""
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=len(USER_AGENTS)) as ex:
+        futures = {ex.submit(_try_one_ua, url, ua): ua for ua in USER_AGENTS}
+        result = None
+        for fut in as_completed(futures):
+            text = fut.result()
+            if text and result is None:
+                result = text
+                # cancel remaining (best-effort)
+                for f in futures:
+                    f.cancel()
+    elapsed = time.time() - t0
+    ua_short = "OK" if result else "FAIL"
+    _log(
+        "INFO" if result else "WARN",
+        f"  sub {ua_short} in {elapsed:.1f}s ({len(result) if result else 0} bytes) <- {url[:60]}",
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -227,22 +262,27 @@ def collect_messages(
     seen_ids: set[int] = set()
     next_before: int | None = None
     stop = False
+    page_num = 0
 
     while not stop:
+        if page_num >= MAX_PAGES:
+            _log("WARN", f"Reached MAX_PAGES={MAX_PAGES}, stopping pagination")
+            break
         url = (
             CHANNEL_URL
             if next_before is None
             else f"{CHANNEL_URL}?before={next_before}"
         )
-        print(f"[INFO] Fetching {url}")
+        _log("INFO", f"Fetching page {page_num + 1}: {url}")
         html = fetch_page(url)
+        page_num += 1
         if not html:
-            print("[WARN] Empty page response, stopping.")
+            _log("WARN", "Empty page response, stopping.")
             break
 
         page_messages = parse_channel_page(html)
         if not page_messages:
-            print("[INFO] No messages on page, stopping.")
+            _log("INFO", "No messages on page, stopping.")
             break
 
         new_on_page = 0
@@ -266,6 +306,10 @@ def collect_messages(
             all_messages.append(msg)
             new_on_page += 1
 
+        _log(
+            "INFO",
+            f"  Page {page_num}: +{new_on_page} new msgs (total so far: {len(all_messages)})",
+        )
         if new_on_page == 0:
             break
 
@@ -277,7 +321,7 @@ def collect_messages(
         next_before = min_id
 
         if not stop:
-            time.sleep(1.5)
+            time.sleep(0.8)
 
     all_messages.sort(key=lambda m: m["id"])
     return all_messages
@@ -399,6 +443,18 @@ def decode_content(content: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _fetch_and_extract(url: str) -> set:
+    """Fetch one subscription URL and extract keys. Used in parallel."""
+    try:
+        raw = fetch_subscription(url)
+        if raw:
+            decoded = decode_content(raw)
+            return set(extract_keys(decoded))
+    except Exception as exc:
+        _log("WARN", f"  sub error {url[:60]}: {exc}")
+    return set()
+
+
 def process_message(msg: dict) -> set:
     """Process one message; return set of VPN keys found."""
     found_keys: set[str] = set()
@@ -406,24 +462,23 @@ def process_message(msg: dict) -> set:
     # 1. Direct keys in message text
     direct = extract_keys(msg["text"])
     if direct:
-        print(f"  [MSG {msg['id']}] Direct keys: {len(direct)}")
+        _log("INFO", f"[MSG {msg['id']}] +{len(direct)} direct keys")
     found_keys.update(direct)
 
-    # 2. Subscription URLs
+    # 2. Subscription URLs — fetch ALL in parallel
     sub_urls = extract_subscription_urls(msg["text"], msg["links"])
-    for url in sub_urls:
-        try:
-            print(f"  [MSG {msg['id']}] Fetching sub: {url}")
-            raw = fetch_subscription(url)
-            if raw:
-                decoded = decode_content(raw)
-                keys = extract_keys(decoded)
-                print(f"    → {len(keys)} keys found")
+    if not sub_urls:
+        return found_keys
+
+    _log("INFO", f"[MSG {msg['id']}] {len(sub_urls)} sub URLs (parallel)")
+    with ThreadPoolExecutor(max_workers=min(len(sub_urls), SUB_WORKERS)) as ex:
+        futures = {ex.submit(_fetch_and_extract, url): url for url in sub_urls}
+        for fut in as_completed(futures):
+            try:
+                keys = fut.result()
                 found_keys.update(keys)
-            else:
-                print(f"    → no response")
-        except Exception as exc:
-            print(f"  [WARN] Error processing sub URL {url}: {exc}")
+            except Exception as exc:
+                _log("WARN", f"  future error: {exc}")
 
     return found_keys
 
@@ -434,45 +489,85 @@ def process_message(msg: dict) -> set:
 
 
 def main() -> None:
+    t_start = time.time()
     mode = sys.argv[1] if len(sys.argv) > 1 else "update"
-    print(f"[INFO] Mode: {mode}")
+    _log("INFO", f"=== VPN Collector started | mode={mode} ===")
 
     os.makedirs("keys", exist_ok=True)
 
     state = load_state()
     existing_keys = load_existing_keys()
-    print(f"[INFO] Existing keys loaded: {len(existing_keys)}")
+    _log("INFO", f"Existing keys loaded: {len(existing_keys)}")
 
     if mode == "init":
+        _log("INFO", f"Collecting last {DAYS_INIT} days (max {MAX_PAGES} pages)")
         messages = collect_messages(since_days=DAYS_INIT)
     else:
         last_id = state.get("last_message_id", 0)
-        print(f"[INFO] Collecting messages after id={last_id}")
+        _log("INFO", f"Collecting messages after id={last_id}")
         messages = collect_messages(after_id=last_id)
 
-    print(f"[INFO] Processing {len(messages)} messages")
+    _log("INFO", f"Processing {len(messages)} messages")
 
-    new_keys: set[str] = set()
+    # Collect ALL subscription URLs from ALL messages first, deduplicate, fetch once
+    _log("INFO", "Collecting all subscription URLs across messages...")
+    all_sub_urls: set[str] = set()
+    msg_direct_keys: set[str] = set()
     for msg in messages:
+        msg_direct_keys.update(extract_keys(msg["text"]))
+        urls = extract_subscription_urls(msg["text"], msg["links"])
+        all_sub_urls.update(urls)
+
+    _log(
+        "INFO",
+        f"Direct keys from text: {len(msg_direct_keys)} | Unique sub URLs: {len(all_sub_urls)}",
+    )
+
+    # Fetch all unique sub URLs in parallel
+    new_keys: set[str] = set(msg_direct_keys)
+    if all_sub_urls:
+        _log("INFO", f"Fetching {len(all_sub_urls)} URLs with {SUB_WORKERS} workers...")
+        t_subs = time.time()
+        with ThreadPoolExecutor(max_workers=SUB_WORKERS) as ex:
+            futures = {ex.submit(_fetch_and_extract, url): url for url in all_sub_urls}
+            done = 0
+            for fut in as_completed(futures):
+                done += 1
+                try:
+                    keys = fut.result()
+                    new_keys.update(keys)
+                    _log(
+                        "INFO",
+                        f"  [{done}/{len(all_sub_urls)}] +{len(keys)} keys | total new: {len(new_keys)}",
+                    )
+                except Exception as exc:
+                    _log("WARN", f"  [{done}/{len(all_sub_urls)}] future error: {exc}")
+        _log("INFO", f"All subs fetched in {time.time() - t_subs:.1f}s")
+
+    # (keep for compat, already processed above)
+    for i, msg in enumerate(messages, 1):
         try:
-            keys = process_message(msg)
-            new_keys.update(keys)
+            pass  # already handled above
         except Exception as exc:
-            print(f"[WARN] Error processing message {msg.get('id')}: {exc}")
+            _log("WARN", f"Error processing message {msg.get('id')}: {exc}")
 
     # Update state with latest seen message id
     if messages:
         state["last_message_id"] = max(m["id"] for m in messages)
         save_state(state)
-        print(f"[INFO] State updated: last_message_id={state['last_message_id']}")
+        _log("INFO", f"State updated: last_message_id={state['last_message_id']}")
 
     # Merge and deduplicate
     all_keys = existing_keys | new_keys
     added = len(all_keys) - len(existing_keys)
-    print(f"[DONE] New keys: {added}, Total: {len(all_keys)}")
+    elapsed_total = time.time() - t_start
+    _log(
+        "DONE",
+        f"New keys: {added} | Total: {len(all_keys)} | Time: {elapsed_total:.0f}s",
+    )
 
     save_keys(all_keys)
-    print(f"[DONE] Keys saved to {KEYS_FILE}")
+    _log("DONE", f"Keys saved to {KEYS_FILE}")
 
 
 if __name__ == "__main__":

@@ -2,17 +2,18 @@ name: VPN Key Collector
 
 on:
   schedule:
-    - cron: '0 */3 * * *'
+    - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
       mode:
         description: 'Mode: "init" = collect last 15 days, "update" = only new'
         required: false
-        default: 'update'
+        default: "update"
 
 jobs:
   collect:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     permissions:
       contents: write
 
@@ -23,7 +24,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
