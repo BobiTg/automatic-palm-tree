@@ -1,0 +1,40 @@
+name: VPN Key Collector
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Mode: "init" = collect last 15 days, "update" = only new'
+        required: false
+        default: 'update'
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run collector
+        run: python scripts/collector.py ${{ github.event.inputs.mode || 'update' }}
+
+      - name: Commit updated keys
+        run: |
+          git config user.name "vpn-bot"
+          git config user.email "vpn-bot@users.noreply.github.com"
+          git add keys/
+          git diff --cached --quiet || git commit -m "🔑 Update VPN keys [$(date +'%Y-%m-%d %H:%M')]"
+          git push
