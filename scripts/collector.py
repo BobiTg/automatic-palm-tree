@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup
 
 CHANNEL_URL = "https://t.me/s/Billy_VPN_Emerald"
 KEYS_FILE = "keys/all_keys.txt"
+KEYS_PREMIUM_FILE = "keys/premium_keys.txt"  # только канал + remnawave, только живые
 STATE_FILE = "keys/state.json"
 DAYS_INIT = 15
 MAX_PAGES = 60  # max pages to paginate (60 × ~20 msgs = ~1200 msgs)
@@ -620,6 +621,16 @@ def save_keys_sorted(key_source: dict[str, int], alive: dict[str, bool]) -> None
 
     with open(KEYS_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+    # --- premium file: only alive, only canal+remnawave ---
+    premium: list[str] = []
+    for src in (SRC_DIRECT, SRC_REMNAWAVE):
+        bucket = (False, src)  # False = alive
+        if bucket in groups:
+            premium.extend(sorted(groups[bucket]))
+    with open(KEYS_PREMIUM_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(premium) + "\n")
+    _log("INFO", f"premium_keys.txt: {len(premium)} keys (canal+remnawave, alive only)")
 
 
 def main() -> None:
