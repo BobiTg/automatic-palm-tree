@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,7 +24,20 @@ MAX_PAGES = 60  # max pages to paginate (60 × ~20 msgs = ~1200 msgs)
 SUB_TIMEOUT = 5  # seconds per User-Agent attempt for subscriptions
 FETCH_TIMEOUT = 8  # seconds for channel page fetch
 SUB_WORKERS = 20  # parallel threads for subscription fetching
-MSG_WORKERS = 10  # parallel threads for message processing
+TCP_WORKERS = 200  # parallel threads for TCP checks
+TCP_TIMEOUT = 2.0  # seconds for TCP connect check
+
+# Source priority (lower = better, appears first in output)
+SRC_DIRECT = 0  # key written directly in channel message
+SRC_REMNAWAVE = 1  # from panel/remnawave subscription URL
+SRC_GITHUB = 2  # from raw.githubusercontent / gist
+SRC_OTHER = 3  # any other subscription URL
+
+GITHUB_HOSTS = {
+    "raw.githubusercontent.com",
+    "gist.github.com",
+    "gist.githubusercontent.com",
+}
 
 KEY_PATTERN = re.compile(
     r'(vless|vmess|ss|trojan|hy2|hysteria2|tuic)://[^\s\n\r<>"\'`]+',
@@ -443,49 +457,169 @@ def decode_content(content: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _fetch_and_extract(url: str) -> set:
-    """Fetch one subscription URL and extract keys. Used in parallel."""
+# ---------------------------------------------------------------------------
+# Source classification
+# ---------------------------------------------------------------------------
+
+
+def classify_url(url: str) -> int:
+    """Return source priority for a subscription URL."""
+    host = urlparse(url).hostname or ""
+    if host in GITHUB_HOSTS:
+        return SRC_GITHUB
+    return SRC_REMNAWAVE  # panels, CDNs, etc.
+
+
+# ---------------------------------------------------------------------------
+# TCP connectivity check
+# ---------------------------------------------------------------------------
+
+
+def _extract_host_port(key: str) -> tuple[str, int] | None:
+    """Extract (host, port) from a VPN key string."""
+    try:
+        scheme, rest = key.split("://", 1)
+        scheme = scheme.lower()
+
+        if scheme == "vmess":
+            # vmess is base64-encoded JSON
+            padding = rest + "=" * (4 - len(rest) % 4)
+            data = json.loads(
+                base64.b64decode(padding).decode("utf-8", errors="ignore")
+            )
+            host = data.get("add", "")
+            port = int(data.get("port", 0))
+            return (host, port) if host and port else None
+
+        # All others: scheme://[userinfo@]host:port[/path][?query][#frag]
+        # Strip userinfo
+        if "@" in rest:
+            rest = rest.split("@", 1)[1]
+        # Strip path/query/fragment
+        rest = rest.split("/")[0].split("?")[0].split("#")[0]
+        # IPv6
+        if rest.startswith("["):
+            bracket_end = rest.index("]")
+            host = rest[1:bracket_end]
+            port = int(rest[bracket_end + 2 :])
+        else:
+            host, port_str = rest.rsplit(":", 1)
+            port = int(port_str)
+        return (host, port) if host and 0 < port < 65536 else None
+    except Exception:
+        return None
+
+
+def tcp_check(key: str) -> bool:
+    """Return True if the key's host:port is reachable via TCP."""
+    hp = _extract_host_port(key)
+    if not hp:
+        return False
+    host, port = hp
+    try:
+        with socket.create_connection((host, port), timeout=TCP_TIMEOUT):
+            return True
+    except Exception:
+        return False
+
+
+def tcp_check_all(keys: list[str]) -> dict[str, bool]:
+    """TCP-check all keys in parallel. Returns {key: alive}."""
+    _log(
+        "INFO",
+        f"TCP-checking {len(keys)} keys ({TCP_WORKERS} workers, {TCP_TIMEOUT}s timeout)...",
+    )
+    t0 = time.time()
+    results: dict[str, bool] = {}
+    with ThreadPoolExecutor(max_workers=TCP_WORKERS) as ex:
+        fut_map = {ex.submit(tcp_check, k): k for k in keys}
+        for fut in as_completed(fut_map):
+            key = fut_map[fut]
+            try:
+                results[key] = fut.result()
+            except Exception:
+                results[key] = False
+    alive = sum(1 for v in results.values() if v)
+    _log("INFO", f"TCP done in {time.time() - t0:.1f}s: {alive}/{len(keys)} alive")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Fetch + extract helpers
+# ---------------------------------------------------------------------------
+
+
+def _fetch_and_extract(url: str) -> tuple[set, int]:
+    """Fetch one subscription URL, extract keys, return (keys_set, src_priority)."""
+    src = classify_url(url)
     try:
         raw = fetch_subscription(url)
         if raw:
             decoded = decode_content(raw)
-            return set(extract_keys(decoded))
+            return set(extract_keys(decoded)), src
     except Exception as exc:
         _log("WARN", f"  sub error {url[:60]}: {exc}")
-    return set()
-
-
-def process_message(msg: dict) -> set:
-    """Process one message; return set of VPN keys found."""
-    found_keys: set[str] = set()
-
-    # 1. Direct keys in message text
-    direct = extract_keys(msg["text"])
-    if direct:
-        _log("INFO", f"[MSG {msg['id']}] +{len(direct)} direct keys")
-    found_keys.update(direct)
-
-    # 2. Subscription URLs — fetch ALL in parallel
-    sub_urls = extract_subscription_urls(msg["text"], msg["links"])
-    if not sub_urls:
-        return found_keys
-
-    _log("INFO", f"[MSG {msg['id']}] {len(sub_urls)} sub URLs (parallel)")
-    with ThreadPoolExecutor(max_workers=min(len(sub_urls), SUB_WORKERS)) as ex:
-        futures = {ex.submit(_fetch_and_extract, url): url for url in sub_urls}
-        for fut in as_completed(futures):
-            try:
-                keys = fut.result()
-                found_keys.update(keys)
-            except Exception as exc:
-                _log("WARN", f"  future error: {exc}")
-
-    return found_keys
+    return set(), src
 
 
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
+
+def save_keys_sorted(key_source: dict[str, int], alive: dict[str, bool]) -> None:
+    """
+    Save keys to KEYS_FILE sorted by:
+      1. alive first, dead last
+      2. within alive: SRC_DIRECT → SRC_REMNAWAVE → SRC_GITHUB → SRC_OTHER
+      3. within same group: alphabetical
+    Writes section headers as comments.
+    """
+    os.makedirs("keys", exist_ok=True)
+
+    groups: dict[tuple[bool, int], list[str]] = {}
+    for key, src in key_source.items():
+        is_alive = alive.get(key, False)
+        bucket = (not is_alive, src)  # False sorts before True → alive first
+        groups.setdefault(bucket, []).append(key)
+
+    src_labels = {
+        SRC_DIRECT: "канал (прямые)",
+        SRC_REMNAWAVE: "подписки (panel/remnawave)",
+        SRC_GITHUB: "подписки (github)",
+        SRC_OTHER: "подписки (прочие)",
+    }
+
+    lines: list[str] = []
+    prev_alive_state: bool | None = None
+    prev_src: int | None = None
+
+    for dead, src in sorted(groups.keys()):
+        is_alive = not dead
+        keys_in_group = sorted(groups[(dead, src)])
+
+        if prev_alive_state != is_alive:
+            if lines:
+                lines.append("")
+            lines.append("# " + ("=" * 60))
+            lines.append(
+                "# " + ("✅ РАБОЧИЕ" if is_alive else "❌ НЕРАБОЧИЕ (TCP недоступны)")
+            )
+            lines.append("# " + ("=" * 60))
+            prev_alive_state = is_alive
+            prev_src = None
+
+        if prev_src != src:
+            lines.append("")
+            lines.append(
+                f"# --- {src_labels.get(src, 'прочие')} ({len(keys_in_group)} шт) ---"
+            )
+            prev_src = src
+
+        lines.extend(keys_in_group)
+
+    with open(KEYS_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def main() -> None:
@@ -496,8 +630,12 @@ def main() -> None:
     os.makedirs("keys", exist_ok=True)
 
     state = load_state()
-    existing_keys = load_existing_keys()
-    _log("INFO", f"Existing keys loaded: {len(existing_keys)}")
+    # key_source: {key_str: src_priority}
+    existing_raw = load_existing_keys()  # set[str] — keys without comments
+    existing_key_source: dict[str, int] = {
+        k: SRC_OTHER for k in existing_raw if not k.startswith("#")
+    }
+    _log("INFO", f"Existing keys loaded: {len(existing_key_source)}")
 
     if mode == "init":
         _log("INFO", f"Collecting last {DAYS_INIT} days (max {MAX_PAGES} pages)")
@@ -509,64 +647,77 @@ def main() -> None:
 
     _log("INFO", f"Processing {len(messages)} messages")
 
-    # Collect ALL subscription URLs from ALL messages first, deduplicate, fetch once
-    _log("INFO", "Collecting all subscription URLs across messages...")
-    all_sub_urls: set[str] = set()
-    msg_direct_keys: set[str] = set()
+    # --- Step 1: collect direct keys and sub URLs ---
+    _log("INFO", "Step 1: collecting direct keys & sub URLs...")
+    new_key_source: dict[str, int] = {}  # key → best source priority
+
+    all_sub_urls: dict[str, int] = {}  # url → src_priority
     for msg in messages:
-        msg_direct_keys.update(extract_keys(msg["text"]))
-        urls = extract_subscription_urls(msg["text"], msg["links"])
-        all_sub_urls.update(urls)
+        # direct keys
+        for k in extract_keys(msg["text"]):
+            new_key_source[k] = min(new_key_source.get(k, 99), SRC_DIRECT)
+        # sub URLs
+        for url in extract_subscription_urls(msg["text"], msg["links"]):
+            src = classify_url(url)
+            all_sub_urls[url] = min(all_sub_urls.get(url, 99), src)
 
     _log(
-        "INFO",
-        f"Direct keys from text: {len(msg_direct_keys)} | Unique sub URLs: {len(all_sub_urls)}",
+        "INFO", f"  Direct keys: {len(new_key_source)} | Sub URLs: {len(all_sub_urls)}"
     )
 
-    # Fetch all unique sub URLs in parallel
-    new_keys: set[str] = set(msg_direct_keys)
+    # --- Step 2: fetch all sub URLs in parallel ---
     if all_sub_urls:
-        _log("INFO", f"Fetching {len(all_sub_urls)} URLs with {SUB_WORKERS} workers...")
+        _log(
+            "INFO",
+            f"Step 2: fetching {len(all_sub_urls)} sub URLs ({SUB_WORKERS} workers)...",
+        )
         t_subs = time.time()
         with ThreadPoolExecutor(max_workers=SUB_WORKERS) as ex:
             futures = {ex.submit(_fetch_and_extract, url): url for url in all_sub_urls}
             done = 0
             for fut in as_completed(futures):
+                url = futures[fut]
                 done += 1
                 try:
-                    keys = fut.result()
-                    new_keys.update(keys)
+                    keys, src = fut.result()
+                    for k in keys:
+                        new_key_source[k] = min(new_key_source.get(k, 99), src)
                     _log(
                         "INFO",
-                        f"  [{done}/{len(all_sub_urls)}] +{len(keys)} keys | total new: {len(new_keys)}",
+                        f"  [{done}/{len(all_sub_urls)}] +{len(keys)} keys src={src} <- {url[:55]}",
                     )
                 except Exception as exc:
-                    _log("WARN", f"  [{done}/{len(all_sub_urls)}] future error: {exc}")
-        _log("INFO", f"All subs fetched in {time.time() - t_subs:.1f}s")
+                    _log("WARN", f"  [{done}/{len(all_sub_urls)}] error: {exc}")
+        _log("INFO", f"  Subs fetched in {time.time() - t_subs:.1f}s")
 
-    # (keep for compat, already processed above)
-    for i, msg in enumerate(messages, 1):
-        try:
-            pass  # already handled above
-        except Exception as exc:
-            _log("WARN", f"Error processing message {msg.get('id')}: {exc}")
+    # --- Step 3: merge with existing ---
+    merged: dict[str, int] = dict(existing_key_source)
+    for k, src in new_key_source.items():
+        merged[k] = min(merged.get(k, 99), src)
+    added = len(merged) - len(existing_key_source)
+    _log("INFO", f"Step 3: merged. New: {added} | Total unique: {len(merged)}")
 
-    # Update state with latest seen message id
+    # --- Step 4: TCP check ALL keys in parallel ---
+    _log("INFO", "Step 4: TCP checking all keys...")
+    all_keys_list = list(merged.keys())
+    alive = tcp_check_all(all_keys_list)
+    alive_count = sum(1 for v in alive.values() if v)
+    _log("INFO", f"  Alive: {alive_count} | Dead: {len(all_keys_list) - alive_count}")
+
+    # --- Step 5: save ---
+    save_keys_sorted(merged, alive)
+
+    # Update state
     if messages:
         state["last_message_id"] = max(m["id"] for m in messages)
         save_state(state)
-        _log("INFO", f"State updated: last_message_id={state['last_message_id']}")
+        _log("INFO", f"State: last_message_id={state['last_message_id']}")
 
-    # Merge and deduplicate
-    all_keys = existing_keys | new_keys
-    added = len(all_keys) - len(existing_keys)
     elapsed_total = time.time() - t_start
     _log(
         "DONE",
-        f"New keys: {added} | Total: {len(all_keys)} | Time: {elapsed_total:.0f}s",
+        f"Alive: {alive_count} | Total: {len(merged)} | Time: {elapsed_total:.0f}s",
     )
-
-    save_keys(all_keys)
     _log("DONE", f"Keys saved to {KEYS_FILE}")
 
 
